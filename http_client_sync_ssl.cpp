@@ -1,23 +1,10 @@
 // https://w9f19o6faj.execute-api.us-east-1.amazonaws.com/api/
-// https://stackoverflow.com/questions/28264313/ssl-certificates-and-boost-asio
 
-//
-// Copyright (c) 2016-2017 Vinnie Falco (vinnie dot falco at gmail dot com)
-//
-// Distributed under the Boost Software License, Version 1.0. (See accompanying
-// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
-//
-// Official repository: https://github.com/boostorg/beast
-//
-
-//------------------------------------------------------------------------------
-//
-// Example: HTTP SSL client, synchronous
-//
-//------------------------------------------------------------------------------
-
-#include "root_certificates.hpp"
-
+/**
+ * OSX BUILD Instructions
+ * 
+ * OPENSSL_ROOT_DIR=/usr/local/opt/openssl/ cmake ..
+ */
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -32,89 +19,229 @@ using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
 namespace ssl = boost::asio::ssl;       // from <boost/asio/ssl.hpp>
 namespace http = boost::beast::http;    // from <boost/beast/http.hpp>
 
-// Performs an HTTP GET and prints the response
-int main(int argc, char** argv)
-{
-    try
-    {
-        // Check command line arguments.
-        if(argc != 4)
-        {
-            std::cerr <<
-                "Usage: http-client-sync-ssl <host> <port> <target>\n" <<
-                "Example:\n" <<
-                "    http-client-sync-ssl www.example.com 443 /\n";
-            return EXIT_FAILURE;
+class Uri {
+public:
+    Uri(const std::string &url_s) {
+        const std::string prot_end("://");
+        std::string::const_iterator prot_i = std::search(url_s.begin(), url_s.end(),
+        prot_end.begin(), prot_end.end());
+
+        protocol_.reserve(distance(url_s.begin(), prot_i));
+        std::transform(url_s.begin(), prot_i,
+                  back_inserter(protocol_),
+                  std::ptr_fun<int,int>(tolower)); // protocol is icase
+        if (prot_i == url_s.end()) {
+            return;
         }
-        auto const host = argv[1];
-        auto const port = argv[2];
-        auto const target = argv[3];
 
-        // The io_service is required for all I/O
-        boost::asio::io_service ios;
+        if (protocol_ == "https") {
+            port_ = "443";
+        }
 
-        // The SSL context is required, and holds certificates
-        ssl::context ctx{ssl::context::sslv23_client};
+        std::advance(prot_i, prot_end.length());
+        
+        std::string::const_iterator path_i = std::find(prot_i, url_s.end(), '/');
+        host_.reserve(std::distance(prot_i, path_i));
 
-        // This holds the root certificate used for verification
-        load_root_certificates(ctx);
-        // HACK:
-        ctx.set_options(boost::asio::ssl::context::default_workarounds |
-            boost::asio::ssl::context::no_sslv2 |
-            boost::asio::ssl::context::no_sslv3);
+        std::transform(prot_i, path_i,
+                  std::back_inserter(host_),
+                  std::ptr_fun<int,int>(tolower)); // host is icase
 
-        // These objects perform our I/O
-        tcp::resolver resolver{ios};
-        ssl::stream<tcp::socket> stream{ios, ctx};
-        stream.set_verify_mode(boost::asio::ssl::verify_none);
+        std::string::const_iterator query_i = std::find(path_i, url_s.end(), '?');
+        path_.assign(path_i, query_i);
+        if (query_i != url_s.end()){
+            ++query_i;
+        }
+        query_.assign(query_i, url_s.end());
+    }
 
-        // Look up the domain name
-        auto const lookup = resolver.resolve({host, port});
+    ~Uri() = default;
 
-        // Make the connection on the IP address we get from a lookup
-        boost::asio::connect(stream.next_layer(), lookup);
+    const std::string & protocol() const {
+        return protocol_;
+    }
 
-        // Perform the SSL handshake
-        stream.handshake(ssl::stream_base::client);
+    const std::string & host() const {
+        return host_;
+    }
 
-        // Set up an HTTP GET request message
-        http::request<http::string_body> req{http::verb::get, target, 11};
-        req.set(http::field::host, host);
-        req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    const std::string & path() const {
+        return path_;
+    }
 
-        // Send the HTTP request to the remote host
-        http::write(stream, req);
+    const std::string & query() const {
+        return query_;
+    }
 
-        // This buffer is used for reading and must be persisted
+    const std::string & port() const {
+        return port_;
+    }
+
+    bool secure() {
+        return protocol_ == "https";
+    }
+
+private:
+    std::string protocol_;
+    std::string host_;
+    std::string path_;
+    std::string query_;
+    std::string port_{"80"};
+};
+
+class HTTPClientInterface {
+public:
+    virtual ~HTTPClientInterface() = default;
+    virtual void connect(boost::asio::ip::tcp::resolver::iterator lookup) = 0;
+    virtual void write(http::request<http::string_body> &req) = 0;
+    virtual std::unique_ptr<http::response<http::dynamic_body>> read() = 0;
+    virtual void close() = 0;
+};
+
+class HTTPClient : public HTTPClientInterface {
+public:
+
+    HTTPClient(boost::asio::io_service &ios) : socket_(ios) {}
+    ~HTTPClient() = default;
+
+    void connect(boost::asio::ip::tcp::resolver::iterator lookup) {
+        boost::asio::connect(socket_, lookup);
+    }
+
+    void write(http::request<http::string_body> &req) {
+        http::write(socket_, req);
+    }
+
+    std::unique_ptr<http::response<http::dynamic_body>> read() {
+        auto res = std::make_unique<http::response<http::dynamic_body>>();
         boost::beast::flat_buffer buffer;
+        http::read(socket_, buffer, *res);
 
-        // Declare a container to hold the response
-        http::response<http::dynamic_body> res;
+        return res;
+    }
 
-        // Receive the HTTP response
-        http::read(stream, buffer, res);
-
-        // Write the message to standard out
-        std::cout << res << std::endl;
-
-        // Gracefully close the stream
+    void close() {
+        // Gracefully close the socket
         boost::system::error_code ec;
-        stream.shutdown(ec);
-        if(ec == boost::asio::error::eof)
-        {
-            // Rationale:
-            // http://stackoverflow.com/questions/25587403/boost-asio-ssl-async-shutdown-always-finishes-with-an-error
+        socket_.shutdown(tcp::socket::shutdown_both, ec);
+
+        // not_connected happens sometimes
+        // so don't bother reporting it.
+        if(ec && ec != boost::system::errc::not_connected) {
+            throw boost::system::system_error{ec};
+        }
+    }
+
+private:
+    tcp::socket socket_;
+};
+
+class HTTPSClient : public HTTPClientInterface {
+public:
+    HTTPSClient(boost::asio::io_service &ios, ssl::context &ctx) : stream_(ios, ctx) {}
+    ~HTTPSClient() = default;
+
+    void connect(boost::asio::ip::tcp::resolver::iterator lookup) {
+        boost::asio::connect(stream_.next_layer(), lookup);
+        SSL_set_tlsext_host_name(stream_.native_handle(), lookup->host_name().c_str());
+        stream_.handshake(ssl::stream_base::client);
+    }
+
+    void write(http::request<http::string_body> &req) {
+        http::write(stream_, req);
+    }
+
+    std::unique_ptr<http::response<http::dynamic_body>> read() {
+        auto res = std::make_unique<http::response<http::dynamic_body>>();
+        boost::beast::flat_buffer buffer;
+        http::read(stream_, buffer, *res);
+
+        return res;
+    }
+
+    void close() {
+        boost::system::error_code ec;
+        stream_.shutdown(ec);
+        if (ec == boost::asio::error::eof) {
             ec.assign(0, ec.category());
         }
-        if(ec)
-            throw boost::system::system_error{ec};
 
-        // If we get here then the connection is closed gracefully
+        if (ec) {
+            throw boost::system::system_error{ec};
+        }
     }
-    catch(std::exception const& e)
-    {
+
+private:
+    ssl::stream<tcp::socket> stream_;
+};
+
+class Requests {
+public:
+    Requests() {
+        ctx_.set_verify_mode(boost::asio::ssl::verify_none);
+        ctx_.set_options(boost::asio::ssl::context::default_workarounds);
+    }
+    ~Requests() {}
+
+    std::unique_ptr<http::response<http::dynamic_body>> Request(const std::string &host, const std::string &port, const std::string &path, bool secure) {
+        std::unique_ptr<HTTPClientInterface> client;
+
+        if (secure) {
+            client = std::make_unique<HTTPSClient>(ios_, ctx_);
+        } else {
+            client = std::make_unique<HTTPClient>(ios_);
+        }
+
+        // Look up the domain name
+        auto const lookup = resolver_.resolve({host, port});
+        client->connect(lookup);
+
+        // Set up an HTTP GET request message
+        http::request<http::string_body> req{http::verb::get, path, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "Richard-Agent");
+
+        client->write(req);
+        auto res = client->read();
+
+        // Write the message to standard out
+        std::cout << *res << std::endl;
+        client->close();
+
+        return res;
+    }
+
+    std::unique_ptr<http::response<http::dynamic_body>> Get(const std::string &url) {
+        
+        Uri u(url);
+        std::cout << u.host() << " " << u.port() << " " << u.path() << '\n';
+        return Request(u.host(), u.port(), u.path(), u.secure());
+    }
+
+private:
+    boost::asio::io_service ios_;
+    tcp::resolver resolver_{ios_};
+    ssl::context ctx_{ssl::context::sslv23_client};
+};
+
+int 
+main(int argc, char* argv[])
+{
+    if (argc != 2){
+        std::cerr << "Usage: <url>\n";
+        return EXIT_FAILURE;
+    }
+
+    try {
+        Requests r;
+        auto const url = argv[1];
+        auto res = r.Get(url);
+        std::cout << *res << '\n';
+  
+    } catch(std::exception const& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
+
     return EXIT_SUCCESS;
 }
