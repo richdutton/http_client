@@ -1,3 +1,0 @@
-/Users/Richard/src/cpp/andrew/build/CMakeFiles/rebuild_cache.dir
-/Users/Richard/src/cpp/andrew/build/CMakeFiles/edit_cache.dir
-/Users/Richard/src/cpp/andrew/build/CMakeFiles/app.dir
